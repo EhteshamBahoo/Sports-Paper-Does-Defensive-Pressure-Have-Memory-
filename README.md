@@ -332,6 +332,93 @@ continuity.
 
 ---
 
+## Fallback thesis (logged 2026-08-13, before Stage 2 is fitted)
+
+Recorded now so it cannot be a post-hoc pivot if the residual signal is null.
+
+Of 846,870 press runs, only **8.8%** end in a progressive escape. The full
+decomposition:
+
+| outcome of a press run | share |
+|---|---|
+| turnover | 27.6% |
+| escape, no separation gained (`neither`) | 24.5% |
+| escape with separation but no progression (`relief`) | 21.7% |
+| **escape with both (`progressive`)** | **8.8%** |
+| stoppage (foul 6.9%, out of play 1.4%) | 8.3% |
+| escape, separation unmeasurable | 5.9% |
+| shot | 2.9% |
+
+**Claim: successful pressing does not primarily win the ball; it primarily denies
+progression without winning it.** Pressure ends in a turnover 27.6% of the time,
+but leaves the attacking team holding the ball and going nowhere 46.2% of the
+time (`neither` + `relief`). The modal press outcome is not a takeaway.
+
+This is measurable on Tier 1, needs no freeze frames, is coach-legible, and does
+not depend on the memory hypothesis surviving Stage 2.
+
+---
+
+## Stage 1 baseline (fitted 2026-08-13)
+
+`python stage1_baseline.py --final`. Three-way split **by match** (50/20/30,
+deterministic SHA-256 of `match_id`); all specification choices made on
+validation; test touched once.
+
+### pass_length and pass_angle are post-treatment
+
+StatsBomb sets `end_location` to where the ball actually ended, so an intercepted
+pass has its length truncated at the interception point. On train: complete
+passes have p10 length **8.07 m**, incomplete **3.61 m**, and **61%** of passes
+recorded under 5 m are interceptions (completing at 0.387 against 0.825 overall).
+A baseline containing `pass_length` is therefore partly predicting the outcome
+from the outcome.
+
+| model | features | test Brier | test skill | worst decile |
+|---|---|---|---|---|
+| M0 | pre-treatment only | 0.11060 | 0.232 | 0.0358 |
+| **M0i** | **M0 + height×zone, height×play-pattern** | **0.10947** | **0.240** | **0.0193** |
+| M1 | spec-exact (pressure + zone + length/angle) | 0.10228 | 0.290 | 0.0327 |
+| M2 | M0 + length/angle | 0.09358 | 0.350 | 0.0245 |
+| M3 | M2 + height×length | 0.09278 | 0.356 | 0.0156 |
+
+Validation and test agree to ~0.001 Brier throughout, so none of this is
+overfitting. **M0i is the residual base for Stage 2.** The M3−M0i skill gap
+(0.356 vs 0.240) means roughly **a third of the conventional model's apparent
+skill comes from outcome leakage**, not football.
+
+Pressure enters M0i with the expected sign and modest size: `under_pressure`
+−0.195, `inv_presser_dist` −0.349, `multi_presser` −0.473 log-odds.
+
+### ⚠️ The baseline is miscalibrated *within* the pressed subsample
+
+Aggregate calibration on pressed passes looks perfect (predicted 0.7581 vs
+observed 0.7561, +0.0020). It is not. Split by predicted probability, the errors
+cancel rather than vanish:
+
+| quintile of predicted p, pressed passes only | n | predicted | observed | diff |
+|---|---|---|---|---|
+| (0.058, 0.543] | 32,188 | 0.3997 | 0.4606 | **+0.0609** |
+| (0.543, 0.783] | 32,187 | 0.6757 | 0.6794 | +0.0037 |
+| (0.783, 0.893] | 32,188 | 0.8452 | 0.8276 | −0.0176 |
+| (0.893, 0.934] | 32,187 | 0.9160 | 0.8851 | **−0.0309** |
+| (0.934, 0.999] | 32,188 | 0.9538 | 0.9278 | **−0.0260** |
+
+The model is too pessimistic about hard pressed passes and too optimistic about
+easy ones — a systematic **slope** error, not a level error. Pressed passes are
+also enriched in the miscalibrated tail (36.6% of the [0, 0.2) bin is pressed
+against 13.5% of the [0.8, 1.0) bin), though only 0.75% of pressed passes fall
+below 0.2.
+
+**This would corrupt Stage 2.** The residual is signed as a function of where a
+pass sits in the predicted distribution, and pressure history correlates with
+that position (sustained pressure pushes play deeper and passes harder). Stage 2
+would pick up baseline misfit and report it as memory. Before fitting Stage 2,
+M0i needs pressure interacted with the geometry terms so the pressed subsample
+gets its own slope, or a separate baseline fitted within strata.
+
+---
+
 ## Scope
 
 This repository contains the pressure-memory analysis only. A separate computer
