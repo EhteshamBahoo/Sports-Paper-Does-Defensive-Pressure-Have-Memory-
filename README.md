@@ -264,6 +264,41 @@ The modal escape keeps the ball and gets away from the presser without going
 forward. "Escape" should be split into **relief** and **progressive escape**
 rather than treated as one risk.
 
+### Presser staleness and falsification test 3b
+
+The `Pressure` event records the presser's position at *t − lead*, while the
+freeze frame records every opponent at the moment of the pass. The gap between
+them, as a function of lead, is the drift. Fitted over 14,532 pressed passes with
+a freeze frame across 120 matches:
+
+```
+median positional error  =  2.46 m  +  1.02 m/s x lead
+```
+
+The 2.46 m intercept is the irreducible floor. For `lag1_presser_dist_to_t` the
+staleness **compounds**, because the presser position is recorded at (t−1 − lead)
+while the carrier position is at t: median total elapsed time **3.30 s**, implying
+a median positional error of **5.82 m** against a measure whose own median is
+17.76 m — an error/signal ratio of 0.33.
+
+| staleness cap | n retained | % kept | median error | median measure | error/signal |
+|---|---|---|---|---|---|
+| ≤ 1 s | 6,561 | 1.8% | 3.35 m | 8.16 m | 0.41 |
+| ≤ 2 s | 68,877 | 19.1% | 4.03 m | 10.66 m | 0.38 |
+| ≤ 3 s | 156,019 | 43.3% | 4.61 m | 12.90 m | 0.36 |
+| ≤ 5 s | 277,258 | 76.9% | 5.32 m | 15.70 m | 0.34 |
+| none | 360,489 | 100.0% | 5.82 m | 17.76 m | **0.33** |
+
+⚠️ **Capping does not improve signal-to-noise — it makes it slightly worse while
+discarding up to 98% of the data.** A short elapsed time also means the ball has
+not travelled far, so the measure shrinks faster than the error does. Carry
+staleness as a control; do not cap.
+
+**Recommendation for 3b:** run it on **presser identity** as the primary contrast
+(the same defender presses at both t−1 and t on only 5.1% of 360,647 comparable
+passes), with distance as a continuous secondary. Identity is immune to positional
+drift; distance is not.
+
 ### Tier 2 chain coverage
 
 418 usable matches (not the 426 files on disk; eight contain no usable frames),

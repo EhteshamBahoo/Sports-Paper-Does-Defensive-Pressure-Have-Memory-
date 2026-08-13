@@ -19,6 +19,10 @@ Four questions, all answerable before any model is fitted:
      absence of annotation, not a football event. This reports how much of the
      structural escape category survives definitions with a positive signature.
 
+  5. PRESSER STALENESS. The spatial-specificity measure for falsification test 3b
+     uses a defender position recorded seconds earlier. This quantifies the
+     resulting error against 360 ground truth and tests whether capping helps.
+
     python diagnostics.py
     python diagnostics.py --only exits
 """
@@ -252,9 +256,75 @@ def escape_definition() -> None:
     print("  escape rather than treated as one risk.")
 
 
+# Presser drift, measured against 360 ground truth: the Pressure event records the
+# presser's position at t-lead, the freeze frame records every opponent at the
+# moment of the pass, and the gap between them as a function of lead is the drift.
+# Fitted over 14,532 pressed passes with a freeze frame across 120 matches:
+#     median gap = 2.46 m + 1.02 m/s * lead
+# The 2.46 m intercept is the irreducible floor (the nearest visible opponent is
+# not necessarily the annotated presser, plus annotation precision).
+DRIFT_M_PER_S = 1.02
+DRIFT_FLOOR_M = 2.46
+
+
+def presser_staleness() -> None:
+    rule("5. PRESSER STALENESS AND FALSIFICATION TEST 3b")
+    d = analysis_sample(load_passes(columns=[
+        "segment_uid", "event_index", "match_seconds", "is_possession_team",
+        "is_set_piece_restart", "lag1_presser_dist_to_t", "lag1_pressure_lead_s",
+        "presser_involved_at_t",
+    ])).sort_values(["segment_uid", "event_index"])
+
+    dt = (d.match_seconds.astype("Float64")
+          - d.groupby("segment_uid", sort=False)["match_seconds"]
+             .shift(1).astype("Float64"))
+    tot = d.lag1_pressure_lead_s.astype("Float64") + dt
+    err = DRIFT_FLOOR_M + DRIFT_M_PER_S * tot
+    m = d.lag1_presser_dist_to_t.notna() & tot.notna()
+
+    t = tot[m].astype(float)
+    e = err[m].astype(float)
+    v = d.lag1_presser_dist_to_t[m].astype(float)
+    print(f"lag1_presser_dist_to_t is available on {int(m.sum()):,} passes.")
+    print("Its staleness compounds: the t-1 presser position is recorded at")
+    print("(t-1 minus lead), while the carrier position is at t.")
+    print(f"\n  total elapsed time  median {np.median(t):.2f} s"
+          f"   p90 {np.percentile(t, 90):.2f} s")
+    print(f"  implied position error  median {np.median(e):.2f} m"
+          f"   p90 {np.percentile(e, 90):.2f} m")
+    print(f"  the measure itself      median {np.median(v):.2f} m"
+          f"   -> error/signal {np.median(e)/np.median(v):.2f}")
+
+    print(f"\n  capping on staleness (the proposed sensitivity check):")
+    print(f"  {'cap':<10} {'n':>11} {'% kept':>8} {'med err':>10} {'med measure':>13}"
+          f" {'err/signal':>11}")
+    for cap in [1.0, 2.0, 3.0, 5.0, float("inf")]:
+        k = m & (tot <= cap)
+        if int(k.sum()) < 100:
+            continue
+        ee = err[k].astype(float)
+        vv = d.lag1_presser_dist_to_t[k].astype(float)
+        lab = "none" if cap == float("inf") else f"<= {cap:.0f} s"
+        print(f"  {lab:<10} {int(k.sum()):>11,} {100*k.sum()/m.sum():>7.1f}%"
+              f" {np.median(ee):>9.2f} m {np.median(vv):>12.2f} m"
+              f" {np.median(ee)/np.median(vv):>11.2f}")
+    print("\n  Capping does NOT improve signal-to-noise. A short elapsed time also")
+    print("  means the ball has not moved far, so the measure shrinks faster than")
+    print("  the error does. Carry staleness as a control; do not cap.")
+
+    idm = d.presser_involved_at_t.notna()
+    print(f"\n  The discrete form of 3b carries no staleness at all:")
+    print(f"     comparable presser identity at t-1 and t: {int(idm.sum()):,} passes")
+    print(f"     same defender pressing at both:           "
+          f"{100*d.presser_involved_at_t[idm].mean():.1f}%")
+    print("  Run 3b on presser IDENTITY as the primary contrast and distance as a")
+    print("  continuous secondary. Identity is immune to positional drift.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--only", choices=["coverage", "clock", "exits", "escape"])
+    ap.add_argument("--only", choices=["coverage", "clock", "exits", "escape",
+                                       "staleness"])
     args = ap.parse_args()
     if args.only in (None, "coverage"):
         chain_coverage()
@@ -264,6 +334,8 @@ def main() -> None:
         press_run_exits()
     if args.only in (None, "escape"):
         escape_definition()
+    if args.only in (None, "staleness"):
+        presser_staleness()
 
 
 if __name__ == "__main__":
