@@ -1,0 +1,9 @@
+# press-memory — data layer + analysis dependencies.
+# Deliberately minimal. No deep-learning or computer-vision packages belong here.
+# Floors are set to the earliest releases with Python 3.13/3.14 wheels.
+
+pandas>=2.2
+pyarrow>=16.0
+numpy>=1.26
+statsmodels>=0.14.2
+matplotlib>=3.8
