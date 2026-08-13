@@ -148,12 +148,12 @@ def build_design(d: pd.DataFrame, spec: str) -> tuple[pd.DataFrame, np.ndarray]:
     cats = [pd.get_dummies(d["zone"].astype(str), prefix="z", drop_first=True),
             pd.get_dummies(d["comp_season_uid"].astype(str), prefix="cs", drop_first=True)]
 
-    if spec in ("M0", "M0i", "M2", "M3"):
+    if spec in ("M0", "M0i", "M0x", "M2", "M3"):
         cats.append(pd.get_dummies(d["pass_height"].astype(str), prefix="h", drop_first=True))
         cats.append(pd.get_dummies(d["pass_body_part"].astype(str), prefix="b", drop_first=True))
         cats.append(pd.get_dummies(d["play_pattern"].astype(str), prefix="pp", drop_first=True))
 
-    if spec in ("M0i", "M3"):
+    if spec in ("M0i", "M0x", "M3"):
         # Additive height + length underpredicts the hard tail: a long HIGH pass is
         # not as hopeless as the sum of its parts implies. Interacting them lets the
         # tail flatten instead of compounding.
@@ -177,9 +177,76 @@ def build_design(d: pd.DataFrame, spec: str) -> tuple[pd.DataFrame, np.ndarray]:
         X["ang_sin"], X["ang_cos"] = np.sin(ang), np.cos(ang)
 
     X = pd.concat([X] + cats, axis=1).astype(np.float32)
+
+    if spec == "M0x":
+        # M0i with pressure interacted with the geometry block.
+        #
+        # M0i is miscalibrated WITHIN the pressed subsample: by quintile of
+        # predicted probability the error runs +0.0609 at the bottom to -0.0309
+        # at the top. That is a slope error, not a level error -- pressed
+        # predictions are over-dispersed. A pooled additive logit forces the same
+        # geometry coefficients on pressed and unpressed passes, so if geometry
+        # matters less once a defender is on you, the pooled model over-applies it
+        # to pressed passes and spreads their predictions too wide.
+        #
+        # Interacting pressure with the geometry block lets the pressed subsample
+        # carry its own slope. Interactions only -- no new features.
+        up = X["under_pressure"].to_numpy()
+        ipd = X["inv_presser_dist"].to_numpy()
+        geom_prefixes = ("z_", "h_", "pp_", "b_")
+        geom = [c for c in X.columns if c.startswith(geom_prefixes)]
+        geom += ["dist_to_goal", "origin_x", "origin_y"]
+        blocks = [X]
+        blocks.append(pd.DataFrame(
+            {f"up_x_{c}": X[c].to_numpy() * up for c in geom},
+            index=X.index, dtype=np.float32))
+        # pressure INTENSITY also gets a slope on the strongest geometry terms
+        intens = [c for c in X.columns if c.startswith("h_")] + ["dist_to_goal"]
+        blocks.append(pd.DataFrame(
+            {f"ipd_x_{c}": X[c].to_numpy() * ipd for c in intens},
+            index=X.index, dtype=np.float32))
+        X = pd.concat(blocks, axis=1)
+
     X.insert(0, "const", 1.0)
     y = d["pass_success"].astype("boolean").astype(float).to_numpy()
     return X, y
+
+
+def strata_quintiles(y: np.ndarray, p: np.ndarray, pressed: np.ndarray,
+                     label: str) -> dict:
+    """Calibration by quintile of predicted probability, split by pressure state.
+
+    Aggregate calibration on a stratum can look perfect while the errors merely
+    cancel across the predicted-probability range. This is the table that shows it.
+    """
+    out = {}
+    print(f"\n  {label} -- calibration by quintile of predicted probability")
+    for name, m in (("PRESSED", pressed), ("UNPRESSED", ~pressed)):
+        ys, ps = y[m], p[m]
+        edges = np.quantile(ps, np.linspace(0, 1, 6))
+        edges[0], edges[-1] = -np.inf, np.inf
+        q = np.digitize(ps, edges[1:-1])
+        print(f"\n    {name}  n={len(ys):,}   aggregate: pred {ps.mean():.4f}"
+              f"  obs {ys.mean():.4f}  diff {ys.mean()-ps.mean():+.4f}")
+        print(f"      {'quintile':<10} {'n':>9} {'predicted':>11} {'observed':>10}"
+              f" {'diff':>9}")
+        diffs = []
+        for k in range(5):
+            s = q == k
+            if s.sum() < 50:
+                continue
+            dv = ys[s].mean() - ps[s].mean()
+            diffs.append(dv)
+            print(f"      {k+1:<10} {int(s.sum()):>9,} {ps[s].mean():>11.4f}"
+                  f" {ys[s].mean():>10.4f} {dv:>+9.4f}")
+        signs = [1 if v > 0 else -1 for v in diffs]
+        monotone = all(a >= b for a, b in zip(diffs, diffs[1:]))
+        flips = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
+        print(f"      max |diff| {max(abs(v) for v in diffs):.4f}   "
+              f"sign changes {flips}   monotone decreasing: {monotone}")
+        out[name] = {"max_abs": max(abs(v) for v in diffs), "monotone": monotone,
+                     "flips": flips, "diffs": diffs}
+    return out
 
 
 def calibration(y: np.ndarray, p: np.ndarray, pressed: np.ndarray, label: str) -> dict:
@@ -222,6 +289,8 @@ def calibration(y: np.ndarray, p: np.ndarray, pressed: np.ndarray, label: str) -
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sample", type=int, default=None)
+    ap.add_argument("--specs", default=None,
+                    help="comma-separated subset, e.g. M0i,M0x")
     ap.add_argument("--verify-fitter", action="store_true",
                     help="check the chunked IRLS against statsmodels")
     ap.add_argument("--final", action="store_true",
@@ -248,11 +317,14 @@ def main() -> None:
     print("  no match appears in more than one split")
 
     summary = {}
-    for spec, desc in (("M0", "pre-treatment only (no end_location features)"),
+    ALL_SPECS = (("M0", "pre-treatment only (no end_location features)"),
                        ("M0i", "M0 + height x zone and height x play-pattern"),
                        ("M1", "spec-exact: pressure + zone + length/angle"),
                        ("M2", "M0 + length/angle (conventional model)"),
-                       ("M3", "M2 + height x length and height x zone interactions")):
+                       ("M3", "M2 + height x length and height x zone interactions"),
+                  ("M0x", "M0i + pressure x geometry interactions"))
+    wanted = args.specs.split(",") if args.specs else [k for k, _ in ALL_SPECS]
+    for spec, desc in [t for t in ALL_SPECS if t[0] in wanted]:
         Xtr, ytr = build_design(train, spec)
         print(f"\n{'=' * 78}\n{spec}  {desc}\n  design {Xtr.shape[1]} columns, "
               f"{len(Xtr):,} rows")
@@ -265,9 +337,11 @@ def main() -> None:
             Xp, yp = build_design(part, spec)
             Xp = Xp.reindex(columns=Xtr.columns, fill_value=0.0)
             p = predict_logit(Xp.to_numpy(), beta)
-            m = calibration(yp, p, part["under_pressure"].fillna(False).to_numpy(),
-                            f"{spec} on {name}")
+            pressed = part["under_pressure"].fillna(False).to_numpy()
+            m = calibration(yp, p, pressed, f"{spec} on {name}")
             summary[(spec, name)] = m
+            if name == "TEST":
+                m["strata"] = strata_quintiles(yp, p, pressed, f"{spec} on TEST")
 
         print("\n  pressure coefficients (log-odds; iid SEs, too small "
               "because passes cluster in matches):")

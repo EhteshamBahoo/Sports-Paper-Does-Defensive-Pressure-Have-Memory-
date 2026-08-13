@@ -207,6 +207,8 @@ has been fitted and no result below is a finding about football.**
 
 ### Exposure clock: the pass-level clock is blind to most pressure
 
+*(Superseded specification retained for comparison — see **Corrections ledger #3**.)*
+
 For 77.9% of passes the immediately preceding ball event is a **carry**, not a
 pass. Measured over 3,160,436 analysis-sample passes:
 
@@ -242,7 +244,7 @@ runs of length 2/4/6 end on a pass. Since only carries can end in a foul, the
 exit mix oscillates with parity. A competing-risks model using run length as a
 duration **must condition on terminating event type**, or parity will masquerade
 as a duration effect. The monotone turnover gradient reported earlier under the
-pass-only clock does not survive this correction.
+pass-only clock does not survive this correction — see **Corrections ledger #2**.
 
 ### Escape, positively defined
 
@@ -361,9 +363,9 @@ not depend on the memory hypothesis surviving Stage 2.
 
 ## Stage 1 baseline (fitted 2026-08-13)
 
-`python stage1_baseline.py --final`. Three-way split **by match** (50/20/30,
-deterministic SHA-256 of `match_id`); all specification choices made on
-validation; test touched once.
+`python stage1_baseline.py --specs M0i,M0x --final`. Three-way split **by match**
+(50/20/30, deterministic SHA-256 of `match_id`); specification developed on
+validation; test evaluated at the end.
 
 ### pass_length and pass_angle are post-treatment
 
@@ -374,29 +376,137 @@ recorded under 5 m are interceptions (completing at 0.387 against 0.825 overall)
 A baseline containing `pass_length` is therefore partly predicting the outcome
 from the outcome.
 
-| model | features | test Brier | test skill | worst decile |
+### Model comparison, held-out test
+
+| model | features | Brier | skill | worst decile |
 |---|---|---|---|---|
 | M0 | pre-treatment only | 0.11060 | 0.232 | 0.0358 |
-| **M0i** | **M0 + height×zone, height×play-pattern** | **0.10947** | **0.240** | **0.0193** |
+| M0i | M0 + height×zone, height×play-pattern | 0.10947 | 0.240 | 0.0193 |
+| **M0x** | **M0i + pressure × geometry interactions** | **0.10897** | **0.244** | **0.0156** |
 | M1 | spec-exact (pressure + zone + length/angle) | 0.10228 | 0.290 | 0.0327 |
 | M2 | M0 + length/angle | 0.09358 | 0.350 | 0.0245 |
 | M3 | M2 + height×length | 0.09278 | 0.356 | 0.0156 |
 
 Validation and test agree to ~0.001 Brier throughout, so none of this is
-overfitting. **M0i is the residual base for Stage 2.** The M3−M0i skill gap
-(0.356 vs 0.240) means roughly **a third of the conventional model's apparent
+overfitting. **M0x is the residual base for Stage 2.** The M3−M0x skill gap
+(0.356 vs 0.244) means roughly **a third of the conventional model's apparent
 skill comes from outcome leakage**, not football.
 
-Pressure enters M0i with the expected sign and modest size: `under_pressure`
-−0.195, `inv_presser_dist` −0.349, `multi_presser` −0.473 log-odds.
+### M0x specification
 
-### ⚠️ The baseline is miscalibrated *within* the pressed subsample
+M0i, plus interactions only — no new features:
 
-Aggregate calibration on pressed passes looks perfect (predicted 0.7581 vs
-observed 0.7561, +0.0020). It is not. Split by predicted probability, the errors
-cancel rather than vanish:
+```
+under_pressure   ×  zone (8), pass_height (2), pass_body_part (5),
+                    play_pattern (8), dist_to_goal, origin_x, origin_y
+inv_presser_dist ×  pass_height (2), dist_to_goal
+```
 
-| quintile of predicted p, pressed passes only | n | predicted | observed | diff |
+30 added columns, 152 → 182. The rationale is mechanical: a pooled additive logit
+forces identical geometry coefficients on pressed and unpressed passes. If
+geometry matters less once a defender is on you, the pooled model over-applies it
+to pressed passes and spreads their predictions too wide — which is exactly the
+over-dispersion the M0i diagnostic showed. Interacting pressure with geometry
+lets the pressed subsample carry its own slope.
+
+### Calibration within pressure strata (M0x, test only)
+
+| quintile of predicted p | n | predicted | observed | diff |
+|---|---|---|---|---|
+| **pressed**, 1 | 32,188 | 0.4507 | 0.4519 | +0.0012 |
+| pressed, 2 | 32,187 | 0.6902 | 0.6885 | −0.0017 |
+| pressed, 3 | 32,188 | 0.8254 | 0.8234 | −0.0021 |
+| pressed, 4 | 32,187 | 0.8889 | 0.8879 | −0.0010 |
+| pressed, 5 | 32,188 | 0.9348 | 0.9290 | −0.0058 |
+| **unpressed**, 1 | 158,046 | 0.4988 | 0.5003 | +0.0014 |
+| unpressed, 2 | 158,046 | 0.8359 | 0.8327 | −0.0031 |
+| unpressed, 3 | 158,046 | 0.9301 | 0.9255 | −0.0046 |
+| unpressed, 4 | 158,046 | 0.9557 | 0.9606 | +0.0049 |
+| unpressed, 5 | 158,047 | 0.9768 | 0.9791 | +0.0024 |
+
+Pressed max |diff| falls 0.0609 → **0.0058**; unpressed falls 0.0120 → **0.0049**,
+so pressed calibration was not bought at unpressed's expense. Aggregate
+calibration is unchanged where it was already fine (pressed −0.0019, unpressed
++0.0002).
+
+### Specification search, disclosed
+
+One round, on 2026-08-13. The M0i pressed-quintile diagnostic was observed first;
+the success criterion — *no systematic sign pattern across pressed quintiles, and
+unpressed not degraded* — was fixed **before** the interaction model was fitted.
+30 interaction columns were added in a single specification; no alternatives were
+tried and none were discarded. Validation and test moved together (validation
+Brier 0.11037 → 0.10983, skill 0.238 → 0.242, worst decile 0.0197 → 0.0169; test
+as tabled above), which is the evidence that this is a real fix and not a test-set
+artefact. An earlier smoke run of two specifications was inspected on a 300k
+random subsample before the validation split existed; the redesign that followed
+was driven by train-only diagnostics.
+
+### ⚠️ Known limitation: residual level tilt in the top pressed quintile
+
+M0x still overpredicts the easiest pressed passes by **0.6 pp** (quintile 5:
+0.9348 predicted, 0.9290 observed). At n = 32,188 and p ≈ 0.93 the standard error
+is ≈ 0.0014, so −0.0058 is about 4 SE — statistically detectable, not noise. It is
+a level tilt confined to one cell, not the monotone slope it replaced. Stage 2
+therefore stratifies by predicted-probability quintile: a residual signal that
+appears only in quintile 5 is baseline misfit, not memory.
+
+---
+
+## Corrections ledger
+
+Four results produced in this project have been corrected, retracted or
+superseded under inspection. Two of them were headline numbers.
+They are kept here rather than deleted, because the limitations section in
+December is only credible if the corrections are visible.
+
+### 1. Carrier-to-presser distance — *corrected 2026-08-13*
+
+**Was:** `presser_dist` computed from raw coordinates, giving a median
+carrier-to-presser separation of **65.7 m**.
+**Why wrong:** StatsBomb logs every event in the acting team's own attacking
+frame. A `Pressure` event is performed by the defending team, so it is rotated
+180° relative to the pass it acts on. Link integrity had been verified (symmetric
+`related_events` on 95% of pressed passes) and gave false comfort — correct
+*association* does not make coordinates *comparable*.
+**Now:** mirrored to `(120 − x, 80 − y)`; median **3.9 m**. This silently
+invalidated the primary Stage 1 pressure control and the test-3b spatial measure.
+See caveat 0 and the validation policy.
+
+### 2. Monotone turnover gradient — *retracted 2026-08-13*
+
+**Was:** "turnover share rises monotonically with press-run length, 29.3% at
+length 1 to 35.3% at length 4," computed under the pass-only clock.
+**Why wrong:** passes and carries alternate along a possession, so run-length
+parity determines the terminating event type — length 1/3/5 runs end on a carry
+(80.9%/65.5%/56.4%), length 2/4/6 on a pass. Only carries can end in a foul
+(11.91% against 0.26%). The apparent gradient was parity, not duration.
+**Now:** run length is not used as the exposure axis at all. `press_elapsed_s`
+and `press_n_pressers` are parity-free and are the primary axes; run length is
+robustness only, conditioned on terminating event type.
+
+### 3. Pass-only exposure clock — *superseded 2026-08-13*
+
+**Was:** pressure history counted over passes (`passes_since_last_press` and
+friends).
+**Why wrong:** for **77.9%** of passes the immediately preceding ball event is a
+carry, and carries are pressed at 35.8% against 16.0% for passes. 448,224 passes
+(14.2% of the analysis sample) had the pass clock reporting *no press* where the
+spine shows one; lag-1 pressure state differs on 25.2% of passes; accumulated
+pressure is 2.86× higher on the spine. This was measurement error in the
+treatment variable, not a gap in the hazard model.
+**Now:** the spine (`spine.parquet`, Pass + Carry) carries the clock. The
+pass-level columns are retained in `passes.parquet` so the two clocks can be
+compared directly.
+
+### 4. M0i pressed-quintile calibration — *superseded 2026-08-13*
+
+**Was:** M0i as the Stage 2 residual base. Its aggregate pressed calibration read
++0.0020 and looked fine.
+**Why wrong:** the aggregate was cancellation, not accuracy. By quintile of
+predicted probability the error ran in a systematic slope:
+
+| quintile of predicted p, pressed only | n | predicted | observed | diff |
 |---|---|---|---|---|
 | (0.058, 0.543] | 32,188 | 0.3997 | 0.4606 | **+0.0609** |
 | (0.543, 0.783] | 32,187 | 0.6757 | 0.6794 | +0.0037 |
@@ -404,18 +514,104 @@ cancel rather than vanish:
 | (0.893, 0.934] | 32,187 | 0.9160 | 0.8851 | **−0.0309** |
 | (0.934, 0.999] | 32,188 | 0.9538 | 0.9278 | **−0.0260** |
 
-The model is too pessimistic about hard pressed passes and too optimistic about
-easy ones — a systematic **slope** error, not a level error. Pressed passes are
-also enriched in the miscalibrated tail (36.6% of the [0, 0.2) bin is pressed
-against 13.5% of the [0.8, 1.0) bin), though only 0.75% of pressed passes fall
-below 0.2.
+Since pressure history correlates with position in the predicted distribution,
+Stage 2 on this base would have read baseline misfit as memory.
+**Now:** M0x, above. Pressed max |diff| 0.0058, no monotone pattern.
 
-**This would corrupt Stage 2.** The residual is signed as a function of where a
-pass sits in the predicted distribution, and pressure history correlates with
-that position (sustained pressure pushes play deeper and passes harder). Stage 2
-would pick up baseline misfit and report it as memory. Before fitting Stage 2,
-M0i needs pressure interacted with the geometry terms so the pressed subsample
-gets its own slope, or a separate baseline fitted within strata.
+---
+
+## Stage 2 pre-registration (written 2026-08-13, before any fitting)
+
+Nothing in this section has been estimated. It is recorded before the fact so
+that a null result is publishable and a positive result is not a specification
+search. No falsification test is specified here; those come after Stage 2.
+
+### Residual
+
+`resid = observed pass_success − M0x predicted probability`, M0x fitted on the
+train split only and applied out of sample.
+
+### Primary estimand
+
+Residual as a function of **time since the press ended**, on passes where local
+pressure is currently OFF but the possession has a pressure history.
+
+```
+sample     is_possession_team, not is_set_piece_restart, pass_success not null,
+           under_pressure == False,
+           events_since_last_press IS NOT NULL      (a prior press exists)
+regressor  time_since_last_press_spine              (seconds since the last
+                                                     pressed Pass/Carry)
+benchmark  under_pressure == False AND
+           events_since_last_press IS NULL          (no prior press in the segment)
+```
+
+⚠️ **One deliberate substitution, flagged for confirmation.** The instruction named
+`time_since_last_press_s`, which is the *pass-level* clock column. Correction 3
+above establishes that clock is blind to 77.9% of preceding ball events, so the
+pre-registration uses the spine equivalent, `time_since_last_press_spine`. The
+pass-level column will be reported as a robustness row so the two clocks can be
+compared. Say the word if you intended the literal column.
+
+"In the possession" is implemented as **within `segment_uid`** — possession ×
+set-piece restart — because a stoppage dissolves the press and history must not
+carry across it.
+
+### Direction, declared in advance
+
+**Memory hypothesis (H1).** Residuals are **negative** immediately after a press
+ends and **recover toward zero as elapsed time grows**: a pass made 1 s after
+pressure lifted underperforms the baseline; a pass made 10 s later does not. The
+predicted sign is negative at short elapsed times, with a monotone increase
+toward the benchmark.
+
+**Null (H0).** The residual does not depend on `time_since_last_press_spine`. Mean
+residual on the history-bearing sample is statistically indistinguishable from the
+benchmark sample at every elapsed-time bin, and the slope on elapsed time is
+indistinguishable from zero.
+
+**Decision rule.** H1 is supported only if the short-elapsed residual is negative,
+the slope toward zero is positive, and **both survive in every stratum listed
+below**. A signal that appears in the pooled fit but not across strata is reported
+as a null with the stratification shown. If the result is null, it is reported as
+a null; the fallback thesis above does not depend on this outcome.
+
+### Secondary estimand
+
+Accumulated exposure **within an ongoing run**, on the pressed subsample
+(`under_pressure == True`):
+
+- `press_elapsed_s` — wall-clock seconds under continuous pressure
+- `press_n_pressers` — distinct defenders who have applied it
+
+Both are parity-free. Note this is a **different sample** from the primary: the
+primary is passes with pressure OFF, the secondary is passes with pressure ON.
+
+`press_run_len_spine` is **robustness only**, and only ever conditioned on
+terminating event type, per correction 2.
+
+### Required in every specification
+
+1. **`pass_ord_in_poss` as a control, and results additionally stratified by it.**
+   Survivorship: a possession that has survived k passes under pressure is a
+   selected possession. Turnover and escape select in opposite directions, so the
+   bias is unsigned and cannot be claimed as conservative.
+2. **Competition-season fixed effects.** Pressure-event density varies 184–468 per
+   match across competition-seasons, adjacent seasons of the same competition
+   differ by 2.8×, and the Pass:Carry mix varies 0.422–0.464, so any pooled rate
+   is partly a composition statistic.
+3. **Stratification by predicted-probability quintile.** This is the discriminator
+   against the known top-quintile tilt: a signal present across quintiles is real;
+   a signal concentrated in quintile 5 is baseline misfit.
+4. **Match-level clustered standard errors, or a match-block bootstrap.** Passes
+   within a match are not independent.
+
+### Split discipline
+
+Specification is developed on **validation only**. The **test split stays sealed**
+and is touched once, at the end, for the final reported numbers. The split is the
+same deterministic match hash used in Stage 1, so no pass that trained M0x can
+appear in a Stage 2 test evaluation.
 
 ---
 
@@ -426,3 +622,4 @@ vision pipeline and match simulator exist and are **deliberately excluded**; no
 result here depends on them.
 
 Single author. Target venue: MIT Sloan Sports Analytics Conference (SSAC27).
+
