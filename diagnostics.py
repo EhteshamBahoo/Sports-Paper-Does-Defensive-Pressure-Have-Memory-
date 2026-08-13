@@ -1,202 +1,269 @@
 #!/usr/bin/env python3
 """
-diagnostics.py -- study-design diagnostics computed from data/processed/passes.parquet.
+diagnostics.py -- study-design diagnostics. Reads the built tables only.
 
-Two questions, both answerable before any model is fitted:
+Four questions, all answerable before any model is fitted:
 
-  1. CHAIN COVERAGE. Stage 2 needs freeze frames at t, t-1 and sometimes t-2, each
-     passing the visible-area gate. Per-event coverage is not the relevant number.
-     This reports the actual joint coverage over the lag chain and contrasts it
-     with the naive independence product, which shows whether frame availability
-     clusters (it is not missing at random).
+  1. CHAIN COVERAGE. Stage 2 needs freeze frames at t, t-1 and sometimes t-2,
+     each passing the visible-area gate. Per-event coverage is not the relevant
+     number. Also reports whether censoring is related to the treatment.
 
-  2. PRESS-RUN EXIT DECOMPOSITION. A press run can end by turnover, by escape, or
-     by stoppage. These select in opposite directions, so the mix determines
-     whether a competing-risks model is needed and how it must be specified.
+  2. EXPOSURE CLOCK. How much pressure exposure a pass-level clock misses relative
+     to the ball-event spine. This is measurement error in the treatment variable,
+     not a gap in the hazard model.
 
-Reads the Parquet only. Computes nothing that is not in the table.
+  3. PRESS-RUN EXITS over the spine. Turnover, escape and stoppage select in
+     opposite directions, so the mix determines the competing-risks specification.
+
+  4. ESCAPE, POSITIVELY DEFINED. "Next event lacks the under_pressure flag" is an
+     absence of annotation, not a football event. This reports how much of the
+     structural escape category survives definitions with a positive signature.
 
     python diagnostics.py
+    python diagnostics.py --only exits
 """
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent
-PARQUET = ROOT / "data" / "processed" / "passes.parquet"
+from src.load import load_passes, load_spine, analysis_sample
 
-# International tournaments, for the Tier 2 composition question.
-TOURNAMENT_KEYS = (
-    "World Cup", "UEFA Euro", "Women's Euro", "African Cup", "Copa America",
-)
+TOURNAMENT_KEYS = ("World Cup", "UEFA Euro", "Women's Euro", "African Cup",
+                   "Copa America")
+
+EXIT_GROUPS = {
+    "turnover": ["turnover"],
+    "escape": ["escape", "shot"],
+    "stoppage": ["stoppage_foul", "stoppage_out"],
+    "other": ["clearance", "period_end", "other", "segment_break"],
+}
 
 
 def rule(title: str) -> None:
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
 
 
-def load() -> pd.DataFrame:
-    if not PARQUET.exists():
-        raise SystemExit(f"[diag] {PARQUET} not found. Run `python build.py` first.")
-    # numpy_nullable keeps Int16/boolean rather than degrading to float64/object,
-    # so "no history here" stays NA through every downstream operation.
-    return pd.read_parquet(PARQUET, dtype_backend="numpy_nullable")
-
-
 # --------------------------------------------------------------------------- #
-# 1. chain coverage
-# --------------------------------------------------------------------------- #
-def chain_coverage(df: pd.DataFrame) -> None:
+def chain_coverage() -> None:
     rule("1. TIER 2 CHAIN COVERAGE  (frames needed at t, t-1, t-2)")
-
-    tier2_matches = df.loc[df["ff_available"].fillna(False), "match_id"].unique()
-    d = df[df["match_id"].isin(tier2_matches)].copy()
-    print(f"Tier 2 matches (>=1 freeze frame): {len(tier2_matches)}")
-
-    # The analysis sample: possession-team passes, excluding set-piece restarts.
-    d = d[d["is_possession_team"].fillna(False) & ~d["is_set_piece_restart"].fillna(False)]
-    d = d.sort_values(["segment_uid", "event_index"])
+    df = load_passes(columns=[
+        "match_id", "segment_uid", "event_index", "ff_available", "ff_visible_r3",
+        "ff_visible_r5", "is_possession_team", "is_set_piece_restart",
+        "pass_ord_in_seg", "under_pressure", "seg_press_count_spine", "zone",
+        "competition_name", "season_name", "ff_opp_within_5",
+    ])
+    t2 = df.loc[df["ff_available"].fillna(False), "match_id"].unique()
+    d = analysis_sample(df[df["match_id"].isin(t2)]).sort_values(
+        ["segment_uid", "event_index"])
+    print(f"Tier 2 matches with >=1 usable freeze frame: {len(t2)}")
     print(f"analysis-sample passes in those matches: {len(d):,}")
 
-    have = d["ff_available"].fillna(False).to_numpy()
-    gate = have & d["ff_visible_r5"].fillna(False).to_numpy()
-    gate3 = have & d["ff_visible_r3"].fillna(False).to_numpy()
-
     seg = d["segment_uid"]
+    have = d["ff_available"].fillna(False).to_numpy()
+    gate3 = have & d["ff_visible_r3"].fillna(False).to_numpy()
+    gate5 = have & d["ff_visible_r5"].fillna(False).to_numpy()
+    ordv = d["pass_ord_in_seg"].astype("Float64").to_numpy()
 
-    def lagged(col: np.ndarray, k: int) -> np.ndarray:
-        """Value of `col` k passes earlier in the same segment; False if absent."""
-        s = pd.Series(col, index=d.index)
-        return (
-            s.groupby(seg, sort=False)
-            .shift(k)
-            .fillna(False)
-            .to_numpy()
-            .astype(bool)
-        )
+    def lagged(col, k):
+        return (pd.Series(col, index=d.index).groupby(seg, sort=False).shift(k)
+                .fillna(False).to_numpy().astype(bool))
 
-    rows = []
-    for label, base in (("frame present", have),
-                        ("frame + r3 gate", gate3),
-                        ("frame + r5 gate", gate)):
-        l1 = lagged(base, 1)
-        l2 = lagged(base, 2)
-        # a lag only exists inside the same segment; require it to exist at all
-        ord_seg = d["pass_ord_in_seg"].to_numpy()
-        has1 = ord_seg >= 1
-        has2 = ord_seg >= 2
+    print(f"\n{'gate':<20} {'P(t)':>8} {'P(t,t-1)':>10} {'P(t,t-1,t-2)':>14}"
+          f" {'P(t)^2':>8} {'P(t)^3':>8}")
+    for label, base in (("frame present", have), ("+ 3 m gate", gate3),
+                        ("+ 5 m gate", gate5)):
+        l1, l2 = lagged(base, 1), lagged(base, 2)
+        h1, h2 = ordv >= 1, ordv >= 2
+        p = base.mean()
+        j1 = (base & l1)[h1].mean()
+        j2 = (base & l1 & l2)[h2].mean()
+        print(f"{label:<20} {p:>8.3f} {j1:>10.3f} {j2:>14.3f} {p**2:>8.3f} {p**3:>8.3f}")
 
-        p_t = base.mean()
-        # joint coverage among passes that actually have the required history
-        j1 = (base & l1)[has1].mean() if has1.any() else np.nan
-        j2 = (base & l1 & l2)[has2].mean() if has2.any() else np.nan
-        rows.append((label, p_t, j1, j2, p_t**2, p_t**3))
+    l1, l2 = lagged(gate5, 1), lagged(gate5, 2)
+    print("\nusable passes under the 5 m gate:")
+    print(f"   t only          {int(gate5.sum()):>9,}")
+    print(f"   t and t-1       {int((gate5 & l1 & (ordv >= 1)).sum()):>9,}")
+    print(f"   t, t-1 and t-2  {int((gate5 & l1 & l2 & (ordv >= 2)).sum()):>9,}")
 
-    print(f"\n{'gate':<18} {'P(t)':>8} {'P(t,t-1)':>10} {'P(t,t-1,t-2)':>14}"
-          f" {'naive^2':>9} {'naive^3':>9}")
-    for label, p, j1, j2, n2, n3 in rows:
-        print(f"{label:<18} {p:>8.3f} {j1:>10.3f} {j2:>14.3f} {n2:>9.3f} {n3:>9.3f}")
+    rule("1b. IS THE CENSORING RELATED TO THE TREATMENT?")
+    d = d.assign(gate=gate5, have=have)
+    print(f"{'stratum':<36} {'n':>10} {'P(frame)':>9} {'P(+5m gate)':>12}")
+    for lab, s in (("all analysis-sample passes", d),
+                   ("under_pressure = True", d[d.under_pressure.fillna(False)]),
+                   ("under_pressure = False", d[~d.under_pressure.fillna(False)])):
+        print(f"{lab:<36} {len(s):>10,} {s.have.mean():>9.3f} {s.gate.mean():>12.3f}")
+    print(f"\n{'accumulated spine pressure':<36} {'n':>10} {'P(frame)':>9} {'P(+5m gate)':>12}")
+    for k in [0, 1, 2, 3]:
+        s = d[d.seg_press_count_spine == k]
+        if len(s):
+            print(f"{('= ' + str(k)):<36} {len(s):>10,} {s.have.mean():>9.3f} {s.gate.mean():>12.3f}")
+    s = d[d.seg_press_count_spine >= 4]
+    print(f"{'>= 4':<36} {len(s):>10,} {s.have.mean():>9.3f} {s.gate.mean():>12.3f}")
 
-    print("\n  'naive^k' = P(t)^k, i.e. what joint coverage would be if frame")
-    print("  availability were independent across consecutive passes. Observed")
-    print("  above naive => availability clusters within segments.")
+    print(f"\n{'pitch zone':<36} {'n':>10} {'P(frame)':>9} {'P(+5m gate)':>12}")
+    for z in sorted(d.zone.dropna().unique()):
+        s = d[d.zone == z]
+        print(f"{z:<36} {len(s):>10,} {s.have.mean():>9.3f} {s.gate.mean():>12.3f}")
+    print("\n  Wide channels (y0, y2) are the least covered. Press-to-touchline,")
+    print("  which uses the sideline as an extra defender, is one of the most")
+    print("  canonical pressing patterns in the game. Tier 2 systematically")
+    print("  under-observes exactly that. Zone-as-control fixes the estimation;")
+    print("  it does not recover the missing observations.")
 
-    # absolute usable N, the number that actually decides the design
-    ord_seg = d["pass_ord_in_seg"].to_numpy()
-    l1 = lagged(gate, 1)
-    l2 = lagged(gate, 2)
-    n_t = int(gate.sum())
-    n_t1 = int((gate & l1 & (ord_seg >= 1)).sum())
-    n_t2 = int((gate & l1 & l2 & (ord_seg >= 2)).sum())
-    print(f"\nusable passes under the r5 gate:")
-    print(f"   t only          {n_t:>9,}")
-    print(f"   t and t-1       {n_t1:>9,}")
-    print(f"   t, t-1 and t-2  {n_t2:>9,}")
-
-    # composition
-    rule("1b. TIER 2 COMPOSITION  (generalizability cost)")
-    comp = (
-        df[df["match_id"].isin(tier2_matches)]
-        .groupby(["competition_name", "season_name"], observed=True)["match_id"]
-        .nunique()
-        .sort_values(ascending=False)
-    )
-    total = comp.sum()
-    tourn = sum(
-        n for (c, s), n in comp.items() if any(k in str(c) for k in TOURNAMENT_KEYS)
-    )
-    print(f"{'competition':<38} {'season':<12} {'matches':>8}")
+    rule("1c. TIER 2 COMPOSITION")
+    comp = (df[df.match_id.isin(t2)]
+            .groupby(["competition_name", "season_name"], observed=True)["match_id"]
+            .nunique().sort_values(ascending=False))
+    tourn = sum(n for (c, _), n in comp.items()
+                if any(k in str(c) for k in TOURNAMENT_KEYS))
     for (c, s), n in comp.items():
         mark = "T" if any(k in str(c) for k in TOURNAMENT_KEYS) else " "
-        print(f"{mark} {str(c):<36} {str(s):<12} {n:>8}")
-    print(f"\ninternational tournament matches: {tourn}/{total} = {100*tourn/total:.1f}%")
-    print("league matches:                  "
-          f"{total - tourn}/{total} = {100*(total-tourn)/total:.1f}%")
+        print(f" {mark} {str(c):<34} {str(s):<12} {n:>5}")
+    tot = comp.sum()
+    print(f"\ninternational tournament matches: {tourn}/{tot} = {100*tourn/tot:.1f}%")
 
 
 # --------------------------------------------------------------------------- #
-# 2. press-run exits
+def exposure_clock() -> None:
+    rule("2. EXPOSURE CLOCK: pass-level vs ball-event spine")
+    d = analysis_sample(load_passes(columns=[
+        "is_possession_team", "is_set_piece_restart", "passes_since_last_press",
+        "events_since_last_press", "up_lag1", "up_lag1_spine", "poss_press_count",
+        "seg_press_count_spine", "lag1_spine_type",
+    ]))
+    print(f"analysis-sample passes: {len(d):,}")
+    pc, sc = d.passes_since_last_press, d.events_since_last_press
+
+    blind = (pc.isna() & sc.notna())
+    print(f"\n  pass clock reports NO press in the segment   {pc.isna().sum():>10,}"
+          f"  {100*pc.isna().mean():5.1f}%")
+    print(f"  spine clock reports no press                 {sc.isna().sum():>10,}"
+          f"  {100*sc.isna().mean():5.1f}%")
+    print(f"\n  >>> pass clock blind to a real press:        {blind.sum():>10,}"
+          f"  {100*blind.mean():5.1f}% of the sample")
+    print(f"      as a share of pass-clock nulls: {100*blind.sum()/max(pc.isna().sum(),1):.1f}%")
+
+    both = pc.notna() & sc.notna()
+    print(f"\n  both clocks defined: {both.sum():,}"
+          f"   identical {100*(pc[both] == sc[both]).mean():.1f}%"
+          f"   spine more recent {100*(sc[both] < pc[both]).mean():.1f}%")
+
+    l = d.up_lag1.notna() & d.up_lag1_spine.notna()
+    dis = d.up_lag1[l] != d.up_lag1_spine[l]
+    print(f"\n  lag-1 pressure state differs on {100*dis.mean():.1f}% of passes"
+          f"  ({int(dis.sum()):,} of {int(l.sum()):,})")
+    print(f"      spine says pressed where the pass clock says not: "
+          f"{int(((d.up_lag1_spine[l]) & (~d.up_lag1[l])).sum()):,}")
+    print(f"\n  mean accumulated presses: pass {d.poss_press_count.mean():.3f}"
+          f"   spine {d.seg_press_count_spine.mean():.3f}"
+          f"   ratio {d.seg_press_count_spine.mean()/d.poss_press_count.mean():.2f}x")
+    print("\n  ball event immediately preceding a pass:")
+    for k, v in d.lag1_spine_type.value_counts(dropna=False).head(6).items():
+        print(f"      {str(k):<10} {v:>10,}  {100*v/len(d):5.1f}%")
+
+
 # --------------------------------------------------------------------------- #
-def press_run_exits(df: pd.DataFrame) -> None:
-    rule("2. PRESS-RUN EXIT DECOMPOSITION")
+def press_run_exits() -> None:
+    rule("3. PRESS-RUN EXIT DECOMPOSITION  (over the spine)")
+    s = load_spine(columns=[
+        "event_type", "spine_role", "press_definitional", "under_pressure",
+        "press_run_is_last_spine", "press_run_exit_spine", "press_run_len_spine",
+        "presser_dist", "presser_dist_to_end", "prog_dist", "end_x",
+    ])
+    print("spine composition (under_pressure rate decides the role):")
+    comp = s.groupby("event_type", observed=True).agg(
+        n=("under_pressure", "size"), up_rate=("under_pressure", "mean"))
+    role = s.groupby("event_type", observed=True)["spine_role"].first()
+    for t in comp.sort_values("n", ascending=False).index:
+        print(f"   {t:<14} {comp.loc[t,'n']:>9,}  up={comp.loc[t,'up_rate']:.4f}"
+              f"   role={role[t]}")
 
-    runs = df[df["press_run_is_last"].fillna(False)].copy()
-    print(f"press runs identified: {len(runs):,}")
-    print(f"  (a run = maximal consecutive under_pressure passes by the")
-    print(f"   possession team within one segment_uid)")
-
-    vc = runs["press_run_exit"].value_counts(dropna=False)
-    pct = 100 * vc / vc.sum()
-    print(f"\n{'exit route':<18} {'runs':>9} {'share':>8}")
+    last = s[s.press_run_is_last_spine.fillna(False)]
+    vc = last.press_run_exit_spine.value_counts(dropna=False)
+    print(f"\npress runs over Pass+Carry: {len(last):,}")
+    print(f"\n{'exit route':<18} {'runs':>10} {'share':>8}")
     for k in vc.index:
-        print(f"{str(k):<18} {vc[k]:>9,} {pct[k]:>7.1f}%")
-
-    grouped = {
-        "turnover": ["turnover"],
-        "escape": ["escape", "shot"],
-        "stoppage": ["stoppage_foul", "stoppage_out"],
-        "other": ["period_end", "other"],
-    }
-    print(f"\ncollapsed to the three competing risks:")
-    print(f"{'risk':<18} {'runs':>9} {'share':>8}")
-    for name, keys in grouped.items():
+        print(f"{str(k):<18} {vc[k]:>10,} {100*vc[k]/vc.sum():>7.1f}%")
+    print(f"\n{'competing risk':<18} {'runs':>10} {'share':>8}")
+    for name, keys in EXIT_GROUPS.items():
         n = int(vc.reindex(keys).fillna(0).sum())
-        print(f"{name:<18} {n:>9,} {100*n/vc.sum():>7.1f}%")
-    print("\n  'escape' folds in runs that reached a shot; 'stoppage' splits into")
-    print("  foul/injury vs ball-out-of-play above, since only the former is the")
-    print("  whistle mechanism and the latter also transfers possession.")
+        print(f"{name:<18} {n:>10,} {100*n/vc.sum():>7.1f}%")
 
-    # exit mix by run length -- the shape that matters for competing risks
-    rule("2b. EXIT MIX BY PRESS-RUN LENGTH")
-    runs["run_len"] = runs["press_run_len"].clip(upper=6)
-    tab = pd.crosstab(runs["run_len"], runs["press_run_exit"], normalize="index") * 100
-    counts = runs["run_len"].value_counts().sort_index()
+    print("\nexit mix by run length:")
+    lr = last.assign(run_len=last.press_run_len_spine.clip(upper=6))
+    tab = pd.crosstab(lr.run_len, lr.press_run_exit_spine, normalize="index") * 100
+    cnt = lr.run_len.value_counts().sort_index()
     order = [c for c in ["turnover", "escape", "shot", "stoppage_foul",
-                         "stoppage_out", "period_end", "other"] if c in tab.columns]
-    tab = tab[order]
-    print(f"{'run len':>8} {'n':>8}  " + "".join(f"{c:>15}" for c in order))
+                         "stoppage_out", "clearance", "other"] if c in tab.columns]
+    print(f"{'len':>5} {'n':>9}  " + "".join(f"{c:>14}" for c in order))
     for i in tab.index:
-        cells = "".join(f"{tab.loc[i, c]:>14.1f}%" for c in order)
-        print(f"{int(i):>8} {counts[i]:>8,}  {cells}")
-    print("\n  run len 6 = '6 or more'.")
+        print(f"{int(i):>5} {cnt[i]:>9,}  "
+              + "".join(f"{tab.loc[i, c]:>13.1f}%" for c in order))
+    print("  len 6 = '6 or more'.")
+
+
+# --------------------------------------------------------------------------- #
+def escape_definition() -> None:
+    rule("4. ESCAPE, POSITIVELY DEFINED")
+    s = load_spine(columns=[
+        "press_run_is_last_spine", "press_run_exit_spine", "presser_dist",
+        "presser_dist_to_end", "prog_dist", "end_x", "event_type",
+    ])
+    last = s[s.press_run_is_last_spine.fillna(False)]
+    n_runs = len(last)
+    esc = last[last.press_run_exit_spine == "escape"]
+    print(f"structural escapes: {len(esc):,} of {n_runs:,} runs "
+          f"({100*len(esc)/n_runs:.1f}%)")
+    print("  structural = possession retained and the next Pass/Carry is not")
+    print("  flagged under_pressure. That is an ABSENCE OF ANNOTATION, so it needs")
+    print("  a positive signature before it can carry a competing-risks category.")
+
+    gain = (esc.presser_dist_to_end.astype("Float64")
+            - esc.presser_dist.astype("Float64"))
+    prog = esc.prog_dist.astype("Float64")
+    g = gain.dropna().astype(float)
+    p = prog.dropna().astype(float)
+    print(f"\n  separation gained from the presser over the terminating event:")
+    print(f"     n={len(g):,} ({100*len(g)/len(esc):.1f}% coverage)"
+          f"  median {np.median(g):+.2f} m  frac>0 {100*np.mean(g>0):.1f}%")
+    print(f"  progression toward goal:")
+    print(f"     n={len(p):,} ({100*len(p)/len(esc):.1f}% coverage)"
+          f"  median {np.median(p):+.2f} m  frac>0 {100*np.mean(p>0):.1f}%")
+
+    cands = {
+        "E0 structural (current)": pd.Series(True, index=esc.index),
+        "E1 ball ends >=10 m from the presser": esc.presser_dist_to_end.astype("Float64") >= 10,
+        "E2 gained >=5 m of separation": gain >= 5,
+        "E3 progressed >=5 m toward goal": prog >= 5,
+        "E4 gained >=5 m AND progressed >=5 m": (gain >= 5) & (prog >= 5),
+        "E5 gained separation AND progressed (any)": (gain > 0) & (prog > 0),
+    }
+    print(f"\n  {'definition':<44} {'runs':>9} {'of escapes':>11} {'of all runs':>12}")
+    for name, m in cands.items():
+        n = int(m.fillna(False).sum())
+        print(f"  {name:<44} {n:>9,} {100*n/len(esc):>10.1f}% {100*n/n_runs:>11.1f}%")
+    print("\n  Separation has a clear positive signature; progression does not.")
+    print("  The modal escape keeps the ball and gets away from the presser without")
+    print("  going forward, so 'escape' should be split into relief and progressive")
+    print("  escape rather than treated as one risk.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--only", choices=["coverage", "exits"], default=None)
+    ap.add_argument("--only", choices=["coverage", "clock", "exits", "escape"])
     args = ap.parse_args()
-
-    df = load()
-    print(f"[diag] loaded {len(df):,} passes from {PARQUET.name}")
     if args.only in (None, "coverage"):
-        chain_coverage(df)
+        chain_coverage()
+    if args.only in (None, "clock"):
+        exposure_clock()
     if args.only in (None, "exits"):
-        press_run_exits(df)
+        press_run_exits()
+    if args.only in (None, "escape"):
+        escape_definition()
 
 
 if __name__ == "__main__":

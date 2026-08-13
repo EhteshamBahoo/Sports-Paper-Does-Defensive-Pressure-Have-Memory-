@@ -85,31 +85,66 @@ documentation only; the data layer is always rebuilt from the pin.
 ## Layout
 
 ```
-fetch.py          pinned download of StatsBomb open-data + manifest/verification
-build.py          raw JSON -> one pass-level table
-diagnostics.py    chain-coverage and press-run-exit diagnostics
+fetch.py          pinned download of StatsBomb open-data + verification
+build.py          raw JSON -> spine + estimation table
+validate.py       physical-plausibility checks; run after every build
+diagnostics.py    study-design diagnostics
+src/load.py       the only sanctioned reader (enforces nullable dtypes)
 requirements.txt  pandas, pyarrow, numpy, statsmodels, matplotlib
 data/raw/         gitignored; written by fetch.py
 data/processed/   gitignored; written by build.py
 ```
 
-**JSON is parsed exactly once.** `build.py` writes `data/processed/passes.parquet`
-(one row per pass) and every downstream stage reads that file. No analysis step
-re-opens the raw event JSON.
+**JSON is parsed exactly once.** `build.py` writes two tables and every
+downstream stage reads them. No analysis step re-opens the raw event JSON.
 
-**Always read it like this:**
+| table | grain | rows | purpose |
+|---|---|---|---|
+| `spine.parquet` | one pressed-eligible ball event | 6,969,870 | the exposure clock, press runs, exit taxonomy |
+| `passes.parquet` | one pass | 3,836,550 | the estimation table; joins its history from the spine |
+
+Passes remain the only outcome rows. The spine exists because pressure exposure
+does not happen only on passes: for 77.9% of passes the immediately preceding
+ball event is a **carry**, and a pass-only clock is blind to pressure applied
+during it.
+
+**Always read via `src.load`, never bare `pd.read_parquet`:**
 
 ```python
-df = pd.read_parquet("data/processed/passes.parquet", dtype_backend="numpy_nullable")
+from src.load import load_passes, load_spine, analysis_sample
+df = analysis_sample(load_passes())
 ```
 
 Anything that can be "not applicable" is written as NULL, never 0 and never
-forward-filled — no preceding press, no t−1 within the segment, no freeze frame.
-Without `dtype_backend="numpy_nullable"` pandas degrades those columns to
-`float64`/`object`; with it they stay `Int16`/`boolean` and missingness
-propagates through arithmetic instead of silently becoming a number.
+forward-filled. `src.load` forces `dtype_backend="numpy_nullable"` so those
+columns stay `Int16`/`boolean`; read them with the default backend and they
+degrade to `float64`/`object`, where a stray `.fillna(0)` silently turns "no
+press was ever observed here" into "zero events since the last press".
 
 ---
+
+## Validation policy
+
+**Every derived geometric quantity is checked against a known physical scale
+before it is used.** Run `python validate.py` after every build; it exits
+non-zero on failure.
+
+This policy exists because of a specific near-miss, recorded in caveat 0 below.
+An earlier check that the `Pass`&harr;`Pressure` link is symmetric on 95% of
+pressed passes gave false comfort: **link integrity says nothing about frame
+consistency.** Two things being correctly *associated* does not make their
+coordinates *comparable*. What caught the error was asking how many metres apart
+a presser and the player being pressed were, and whether football permits that
+number.
+
+Current status: 25 checks, 24 pass, 1 warning (3 upstream freeze frames of
+373,640 report more than 11 opponents). Anchors include pass length against
+Euclidean distance (max error 1e-5 m), goal kicks at 114.00 m from the attacking
+goal, corners at 40.00 m, and carrier-to-presser distance at 3.81 m with
+period-to-period spread of 0.010 m.
+
+---
+
 
 ## Data provenance caveats
 
@@ -154,59 +189,111 @@ properties of the upstream data, and they constrain the design:
 
 ---
 
+
+7. **`under_pressure` is definitional, not measured, on four event types.** Over 150
+   matches of raw events: Pass 16.0%, Carry 35.8%, Miscontrol 27.9%, Shot 25.9% —
+   but Dribble, Duel, Dispossessed and Clearance are all **exactly 100.0%**.
+   StatsBomb sets the flag on those by definition. They must stay off the exposure
+   clock or it becomes tautological: every dribble would reset "events since last
+   press" whether or not new pressure occurred. Hence the spine's `clock` role is
+   Pass and Carry only.
+
+---
+
 ## Design diagnostics (computed at the pin)
 
-Run `python diagnostics.py`. These are properties of the data layer, not results:
-no model has been fitted.
+Run `python diagnostics.py`. These are properties of the data layer. **No model
+has been fitted and no result below is a finding about football.**
 
-**Built table:** 3,836,550 passes from 3,961 matches, 285 MB Parquet, 78 s.
-Reconstructed scores match the match index in every one of the 3,961 matches.
+### Exposure clock: the pass-level clock is blind to most pressure
 
-**Chain coverage.** Tier 2 usable matches: **418**, not the 426 files on disk —
-eight files contain no usable freeze frames. Analysis sample (possession-team,
-non-restart) in those matches: 377,509 passes.
+For 77.9% of passes the immediately preceding ball event is a **carry**, not a
+pass. Measured over 3,160,436 analysis-sample passes:
+
+| | pass clock | spine clock |
+|---|---|---|
+| reports no press in the segment | 52.9% | 38.7% |
+| mean accumulated presses | 0.625 | 1.787 (**2.86×**) |
+
+- **448,224 passes (14.2%)** have a pass clock reporting *no press* where the
+  spine shows one — 26.8% of all pass-clock nulls.
+- The lag-1 pressure state differs on **25.2%** of passes; in 509,993 of those the
+  spine says pressed where the pass clock says not.
+
+This is non-classical measurement error in the treatment variable, not a gap in
+the hazard model.
+
+### Press-run exits (846,870 runs over Pass+Carry)
+
+| competing risk | runs | share |
+|---|---|---|
+| escape (incl. reaching a shot) | 539,852 | 63.7% |
+| turnover | 233,747 | 27.6% |
+| stoppage (6.9% foul, 1.4% out) | 70,098 | 8.3% |
+| other | 3,173 | 0.4% |
+
+The whistle share rises from 2.4% under a pass-only definition to **6.9%** here,
+because fouls terminate carries, not passes: the foul-exit rate is **11.91%** on
+carry-terminated runs against **0.26%** on pass-terminated ones, a 46× gap.
+
+⚠️ **Run length is confounded with terminating event type by parity.** Passes and
+carries alternate, so runs of length 1/3/5 end on a carry (80.9%/65.5%/56.4%) and
+runs of length 2/4/6 end on a pass. Since only carries can end in a foul, the
+exit mix oscillates with parity. A competing-risks model using run length as a
+duration **must condition on terminating event type**, or parity will masquerade
+as a duration effect. The monotone turnover gradient reported earlier under the
+pass-only clock does not survive this correction.
+
+### Escape, positively defined
+
+Structural escape (possession retained, next Pass/Carry unflagged) is 60.8% of
+runs. It does have a positive signature — median **+6.29 m** of separation gained
+from the presser, positive in **82.0%** of cases — but it is not progressive:
+median progression **+0.00 m**, positive in only 49.2%.
+
+| definition | share of escapes | of all runs |
+|---|---|---|
+| E0 structural (current) | 100.0% | 60.8% |
+| E1 ball ends ≥10 m from the presser | 46.2% | 28.1% |
+| E2 gained ≥5 m of separation | 50.1% | 30.5% |
+| E3 progressed ≥5 m toward goal | 25.7% | 15.6% |
+| E4 gained ≥5 m **and** progressed ≥5 m | 14.4% | 8.8% |
+| E5 gained separation **and** progressed (any) | 31.4% | 19.1% |
+
+The modal escape keeps the ball and gets away from the presser without going
+forward. "Escape" should be split into **relief** and **progressive escape**
+rather than treated as one risk.
+
+### Tier 2 chain coverage
+
+418 usable matches (not the 426 files on disk; eight contain no usable frames),
+377,509 analysis-sample passes.
 
 | gate | P(t) | P(t, t−1) | P(t, t−1, t−2) | P(t)³ |
 |---|---|---|---|---|
 | frame present | 0.887 | 0.735 | 0.670 | 0.697 |
-| + 3 m visibility gate | 0.846 | 0.675 | 0.594 | 0.605 |
-| + 5 m visibility gate | 0.757 | 0.548 | **0.439** | 0.433 |
+| + 3 m gate | 0.846 | 0.675 | 0.594 | 0.605 |
+| + 5 m gate | 0.757 | 0.548 | **0.439** | 0.433 |
 
 Usable passes under the 5 m gate: 285,614 at t; 190,306 for (t, t−1); 127,935 for
-(t, t−1, t−2). Joint coverage tracks the independence product almost exactly, so
-frame availability is **not** strongly clustered along the lag chain.
+(t, t−1, t−2). Joint coverage tracks the independence product, so availability is
+**not** clustered along the lag chain.
 
 **Censoring is not treatment-related.** P(frame + 5 m gate) is 0.762 on pressed
-passes vs 0.756 on unpressed, and moves from 0.752 to 0.769 as accumulated
-within-segment pressure rises from 0 to ≥4. Both gradients are negligible. The
-censoring is *spatial*: 0.920 in the central attacking channel vs 0.692–0.689 in
-the wide attacking channels, because wide positions sit near the edge of the
-visible-area polygon. Zone is already a Stage 1 control.
+passes against 0.756 on unpressed, and moves only 0.752 → 0.764 as accumulated
+spine pressure rises from 0 to ≥4.
+
+⚠️ **But it is spatially patterned, and that is a coverage limitation, not a
+nuisance to control away.** Coverage is 0.920 in the central attacking channel
+against 0.692 and 0.689 in the wide attacking channels, because wide positions sit
+near the edge of the visible-area polygon. Press-to-touchline — using the sideline
+as an extra defender — is one of the most canonical pressing patterns in the game,
+and Tier 2 systematically under-observes exactly it. Zone-as-control fixes the
+estimation; it does not recover the missing observations.
 
 **Composition.** 292 of 418 Tier 2 matches (**69.9%**) are international
-tournaments.
-
-**Press-run exits.** 442,170 runs (maximal consecutive under-pressure passes by
-the possession team within a segment):
-
-| risk | runs | share |
-|---|---|---|
-| escape (incl. reaching a shot) | 285,195 | 64.5% |
-| turnover | 131,116 | 29.7% |
-| stoppage (2.7% out of play, 2.4% foul) | 22,607 | 5.1% |
-| other / period end | 3,252 | 0.7% |
-
-Turnover share rises monotonically with run length (29.3% at length 1 to 35.3% at
-length 4) while escape falls (62.6% to 55.7%).
-
-⚠️ **The 5.1% stoppage share is an artifact of defining runs over passes.** There
-are 25.2 under-pressure `Foul Won` events per match but only ~2.7 recorded
-`stoppage_foul` run exits — the pass-level definition captures about **11%** of
-press-terminating whistles. 59.5% of pressed fouls occur in possessions containing
-no pressed pass at all, and pressed carries outnumber pressed passes 265.9 to
-152.8 per match. A competing-risks model must therefore be specified over pressed
-**ball-events (passes and carries)**, not passes alone, or the whistle risk is
-structurally undercounted by roughly an order of magnitude.
+tournaments, which press differently from league football and have less squad
+continuity.
 
 ---
 
