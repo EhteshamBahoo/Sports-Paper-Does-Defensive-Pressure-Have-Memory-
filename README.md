@@ -156,11 +156,49 @@ coordinates *comparable*. What caught the error was asking how many metres apart
 a presser and the player being pressed were, and whether football permits that
 number.
 
-Current status: 25 checks, 24 pass, 1 warning (3 upstream freeze frames of
+Current status: 29 checks, 28 pass, 1 warning (3 upstream freeze frames of
 373,640 report more than 11 opponents). Anchors include pass length against
 Euclidean distance (max error 1e-5 m), goal kicks at 114.00 m from the attacking
 goal, corners at 40.00 m, and carrier-to-presser distance at 3.81 m with
 period-to-period spread of 0.010 m.
+
+### Post-treatment features are guilty until justified
+
+*Added 2026-08-17, after the second instance of the same error.*
+
+**Any feature derived from `end_location` is post-treatment by construction and
+must be declared before it can enter a model.** StatsBomb sets `end_location` to
+where the ball actually ended, which on an intercepted pass is the interception
+point — so such a feature is partly a function of the outcome.
+
+This has now happened twice: `pass_length`/`pass_angle` in Stage 1, worth about a
+third of conventional model skill; and four `ff_*` columns in the first draft of
+the Stage 2 threat-B control, worth +7.0 Brier skill points against +0.07 for the
+clean block. The second instance came one stage *after* the first was documented,
+in unfamiliar columns. Prose did not transfer, so it is now mechanical:
+
+1. **A register** — `src.load.POST_TREATMENT`, each entry with its provenance
+   (`build` = computed here, `statsbomb` = arrived already contaminated) and a
+   reason.
+2. **A runtime guard** — `src.load.assert_pre_treatment(cols, allow=(...))`.
+   Using `allow` is a claim that the inclusion is deliberate and stated.
+3. **A source check** — `validate.py` re-derives the truth from `build.py`'s AST
+   rather than trusting the register: taint seeded at `end_location`/`end_x`/
+   `end_y`/`target`, propagated through local assignments and across functions,
+   reported for every output column. An unregistered hit fails the run. It found
+   11 columns; two (`ff_visible_r3`, `ff_visible_r5`) are exempt with a stated
+   argument, because the helpers they use are strictly rowwise so the flagged
+   dataflow carries no value.
+4. **A specification check** — `validate.py` walks `build_design`'s branches and
+   verifies that `M0`/`M0i`/`M0x` read no registered column, while `M1`/`M2`/`M3`
+   read only what they declare. Those three include `pass_length` on purpose:
+   their gap to `M0` *is* the leakage estimate.
+
+The exemption in (3) is load-bearing rather than bookkeeping: `ff_visible_r5` is
+the **sample gate** for the entire Tier 2 arm. Had it been target-derived, the
+gate would have selected on the outcome — a worse defect than the control leak it
+was introduced to avoid. Both guards were verified to fire against a deliberately
+poisoned source before being relied on.
 
 ---
 
@@ -593,6 +631,70 @@ search. No falsification test is specified here; those come after Stage 2.
 > effect-size terms rather than significance, because at n ≈ 10⁶ everything is
 > significant.
 
+> **Amendment 2 — 2026-08-17. THE MEMORY CLAIM IS RETIRED.**
+>
+> ⚠️ **This amendment was written *after* Stage 2 and the mechanism tests, with
+> full knowledge of the results.** It is not a pre-registration and must never be
+> cited as one. It is a retirement notice. Everything above and below it stands
+> unedited as written; this block records what the results did to it.
+>
+> **Retired:** the claim that pressure history has a causal residual effect on
+> subsequent outcomes — "pressure is a possession-level state" in the strong,
+> memory-trace sense. Three reasons, none individually fatal, jointly decisive.
+>
+> 1. **The clean band failed the floor.** The 2–8 s band was the defensible
+>    evidence, being beyond any plausible annotation window. After origin-only
+>    freeze-frame geometry it reads **−0.939 pp** — a *bounded null* on the
+>    pre-registered scale (detectable, below the 1.0 pp relevance floor). Not a
+>    practical null, which is reserved for < 0.5 pp; the distinction does not
+>    rescue anything, but the ledger uses the term it registered.
+> 2. **The surviving band is the unidentifiable one.** What clears the floor after
+>    geometry control is the < 2 s band at −2.7 pp — precisely where the
+>    annotation-resolution qualifier bites hardest: 66.7% of those passes fall
+>    within 0.5 s of a pressure window closing, median gap +0.19 s. The surviving
+>    effect lives in the one window where it cannot be distinguished from the
+>    annotator having called time slightly early.
+> 3. **Threat C, which this data cannot address at all.** StatsBomb 360 freeze
+>    frames carry positions and no velocities. The geometry control therefore
+>    knows where defenders *are*, not where they are *going*. A defence that is
+>    compact and still closing is a different pressure state from one that is
+>    compact and settled, and that difference is largest in the first two seconds
+>    after a press ends, while defenders are still decelerating. The residual that
+>    survives has exactly the shape of unmeasured defender velocity. This cannot
+>    be ruled out with open event data plus static frames, by me or by anyone.
+>    Recorded as a named threat, not a caveat — see the mechanism section.
+>
+> **Replacement claim, and the one the paper makes:**
+>
+> > **Event-level pressure annotation systematically under-measures defensive
+> > pressure, and possession pressure history is a free correction for the
+> > shortfall.**
+>
+> Models that treat pressure as an event attribute understate it; the shortfall
+> persists for several seconds past the annotated flag, decaying on the same
+> timescale as defensive geometry relaxes to benchmark; and possession history
+> recovers roughly half of what freeze-frame geometry provides, at zero additional
+> data cost. This is a measurement claim, not a causal one, and it is what was
+> actually measured.
+>
+> **What the existing numbers now mean.** The uncontrolled −5.487 pp (< 2 s) and
+> −2.645 pp (2–8 s) are no longer candidate causal effects. They are **the size of
+> the measurement gap** — how much outcome-relevant defensive pressure the
+> `under_pressure` flag fails to carry, expressed in completion probability. That
+> is what they always were.
+>
+> **Explicitly not claimed:** that pressing has a lasting causal effect on the
+> pressed team; that the residual is a psychological, physiological or tactical
+> trace; that the < 2 s effect is anything other than jointly consistent with
+> memory, annotation-boundary error, and defender velocity.
+>
+> **Consequences for what follows.** The Q1 non-attenuation diagnosis is
+> **dropped** — it was diagnostic for a claim no longer being made. The
+> falsification suite is retargeted at the measurement claim: spatial specificity
+> (3b) and survivorship still apply and still matter, because a measurement gap
+> should be spatially structured and must not be an artefact of possession
+> selection. The test split remains sealed until the end.
+
 ### Residual
 
 `resid = observed pass_success − M0x predicted probability`, M0x fitted on the
@@ -863,19 +965,41 @@ where the estimand lives. Mean |Δp| is 0.0195 on the benchmark against 0.0304 o
 the primary sample under 2 s, and restricted Brier improves by −0.00091 there
 against +0.00004 on the benchmark.
 
+### Threat C — unmeasured defender velocity: **cannot be addressed with this data**
+
+Not testable here, and stated rather than buried, because it is the threat a
+referee who works with tracking data will raise first.
+
+StatsBomb 360 freeze frames carry **positions only, no velocities**. The threat-B
+control therefore knows where defenders are, not where they are going. A defence
+that is compact and still closing is a different pressure state from one that is
+compact and settled, and the gap between them is largest in the first two seconds
+after a press ends, while defenders are still decelerating. The residual that
+survives threat B has precisely that shape: concentrated under 2 s, gone by 8 s.
+
+No open-data test separates the two. Closing this would need tracking data, which
+is outside the scope of this project by design. Threat C is the reason the causal
+reading is retired rather than merely weakened — see Amendment 2.
+
 ### What this changes
 
-The residual is **not** a pure memory trace. Roughly half of it is contemporaneous
-defensive geometry that event-level pressure annotation fails to record. The
-surviving half is consistent with memory but is not established as such by these
-data, and it is only above the relevance floor within about 2 s.
+The residual is **not** a memory trace, and this project no longer claims it is.
 
-The finding that survives either reading, and is the one to write:
-**event-level pressure annotation systematically under-measures defensive
-pressure, and possession pressure history is a cheap Tier 1 proxy for what it
-misses.** That is a claim against how EPV/OBSO-class models ingest pressure, it
-does not require the memory interpretation, and it is testable by anyone with the
-open data.
+- Roughly half is contemporaneous defensive geometry the annotation fails to
+  record (threat B, measured).
+- Of the surviving half, the part above the relevance floor sits under 2 s, which
+  is where annotation-boundary error is concentrated (threat A's qualifier) and
+  where unmeasured defender velocity would be largest (threat C, untestable).
+- The 2–8 s band — the only window clean of all three — is a **bounded null** at
+  −0.939 pp.
+
+The claim the evidence supports is a **measurement** claim: event-level pressure
+annotation systematically under-measures defensive pressure, and possession
+pressure history is a free Tier 1 correction recovering about half of what
+freeze-frame geometry provides. The uncontrolled −5.487 pp and −2.645 pp are the
+**size of that measurement gap**, not candidate causal effects. This is a claim
+against how EPV/OBSO-class models ingest pressure, it needs no causal
+interpretation, and anyone can check it on the open data. See Amendment 2.
 
 ### Caveats on the Tier 2 arm
 
@@ -887,6 +1011,16 @@ open data.
 - Freeze frames are truncated by `visible_area`. The 5 m origin-visibility gate
   handles the ball carrier; it does not guarantee the wider defensive shape was in
   frame.
+- Positions only, no velocity. See threat C.
+
+### Method note: validate the instrument before trusting its null
+
+Threat A returns "no problem" (0.03% contamination). That is only evidence because
+the same join was first shown capable of returning "problem": passes the annotator
+flagged pressed come back **88.56% inside a live window**, against 0.02% for
+unpressed. Without that step, a broken join and a clean result are the same
+output. This belongs in the paper — a null from an unvalidated instrument is not a
+null, and the check costs one table.
 
 ---
 

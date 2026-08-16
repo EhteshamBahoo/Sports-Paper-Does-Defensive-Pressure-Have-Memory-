@@ -47,6 +47,84 @@ NULL_CRITICAL = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# post-treatment register
+# --------------------------------------------------------------------------- #
+# StatsBomb sets `end_location` to where the ball ACTUALLY ended. On an
+# intercepted pass that is the interception point, not the intended target. Any
+# feature derived from it is therefore partly a function of the outcome, and a
+# model containing one predicts the outcome from the outcome.
+#
+# This has now happened twice in this project: pass_length/pass_angle in Stage 1
+# (worth about a third of conventional model skill), and four ff_* columns in the
+# first draft of the Stage 2 threat-B control (worth +7.0 Brier skill points
+# against +0.07 for the clean block). The second instance came one stage after the
+# first was documented, in unfamiliar columns. A prose warning did not transfer;
+# a register plus a guard might.
+#
+# Membership is verified against build.py's source by validate.py, so this list
+# cannot quietly fall out of date as columns are added.
+# name -> (provenance, reason). Provenance "build" means build.py computes it
+# from end_x/end_y, so validate.py's taint scan must find it; "statsbomb" means
+# the provider already derived it from end_location before we saw it, so no
+# amount of reading build.py reveals the dependency -- which is exactly why
+# pass_length was believed innocent for as long as it was.
+POST_TREATMENT = {
+    "end_x": ("build", "the ball's actual endpoint; interception point on a failure"),
+    "end_y": ("build", "the ball's actual endpoint; interception point on a failure"),
+    "pass_length": ("statsbomb", "provider's Euclidean(start, end_location)"),
+    "pass_angle": ("statsbomb", "provider's atan2 over end_location"),
+    "prog_dist": ("build", "goal-ward progress measured to end_location"),
+    "presser_dist_to_end": ("build", "presser distance measured to end_location"),
+    "escape_sep_gain": ("build", "difference of two distances, one to end_location"),
+    "ff_lane_opp": ("build", "opponents in the corridor from origin to end_location"),
+    "ff_lane_visible": ("build", "visibility of that same corridor"),
+    "ff_recv_opp_within_5": ("build", "opponents within 5 m of end_location"),
+    "ff_recv_visible_r5": ("build", "visibility around end_location"),
+}
+
+# Columns the taint scan flags because end_location flows through the same
+# expression, but whose VALUE provably does not depend on it. Each needs a reason
+# that can be checked by reading, not a promise.
+#
+# This distinction is load-bearing, not bookkeeping: ff_visible_r5 is the SAMPLE
+# GATE for the entire Tier 2 arm of the Stage 2 mechanism test. Were it
+# target-derived, the gate would select on the outcome -- a worse defect than the
+# control-block leak it was introduced to avoid.
+TAINT_EXEMPT = {
+    "ff_visible_r3":
+        "reads probe[0] only, which is the ORIGIN; the target enters probe[1] "
+        "and the lane samples. points_inside and points_edge_dist are strictly "
+        "rowwise -- output element i depends only on input row i, no cross-row "
+        "normalisation -- so index 0 cannot carry the target.",
+    "ff_visible_r5":
+        "same construction as ff_visible_r3, at the 5 m margin. Verified rowwise "
+        "by reading both helpers in build.py.",
+}
+
+
+def assert_pre_treatment(columns, allow=()) -> None:
+    """Refuse to build a design matrix out of outcome-derived features.
+
+    Call this from any modelling script before fitting. `allow` is the escape
+    hatch, and using it is a claim that you have a stated reason -- e.g. Stage 1's
+    M1/M2/M3, which include pass_length deliberately in order to *quantify* the
+    leakage against M0.
+
+        assert_pre_treatment(X.columns)                       # clean specs
+        assert_pre_treatment(X.columns, allow=("pass_length",))  # leakage bound
+    """
+    bad = sorted(set(columns) & set(POST_TREATMENT) - set(allow))
+    if bad:
+        reasons = "\n".join(f"    {c}: {POST_TREATMENT[c][1]}" for c in bad)
+        raise ValueError(
+            "post-treatment features in a design matrix -- each is partly a "
+            f"function of the outcome:\n{reasons}\n"
+            "  Pass allow=(...) if the specification includes them on purpose, "
+            "and say so in the README."
+        )
+
+
 def _read(path: Path, columns: list[str] | None) -> pd.DataFrame:
     if not path.exists():
         raise SystemExit(

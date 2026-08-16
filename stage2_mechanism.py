@@ -54,7 +54,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.load import load_passes, analysis_sample
+from src.load import load_passes, analysis_sample, assert_pre_treatment
 from stage1_baseline import (build_design, fit_logit, predict_logit,
                              match_bucket, TRAIN_HI, VALID_HI, FEATURE_COLS)
 from stage2 import (BIN_EDGES, FLOOR_PP, clustered_mean_se, cluster_ols)
@@ -214,6 +214,15 @@ def add_ff_block(X: pd.DataFrame, d: pd.DataFrame,
     include_post=False keeps only quantities measured around the BALL ORIGIN,
     which is fixed before the outcome is realised.
     """
+    reads = ["ff_nearest_opp_dist", "ff_opp_within_3", "ff_opp_within_5",
+             "ff_n_opp_visible", "ff_n_team_visible"]
+    if include_post:
+        reads += list(FF_POST_COLS)
+    else:
+        # fires if anyone adds a target-derived column to the clean arm, which is
+        # precisely the mistake this block was rebuilt to fix
+        assert_pre_treatment(reads)
+
     nod = d["ff_nearest_opp_dist"].astype("Float64").astype(float)
     blocks = [
         X,

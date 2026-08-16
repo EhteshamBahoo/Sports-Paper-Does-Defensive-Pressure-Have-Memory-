@@ -120,8 +120,28 @@ def match_bucket(match_id: int) -> int:
     return int(hashlib.sha256(str(int(match_id)).encode()).hexdigest(), 16) % HASH_BUCKETS
 
 
+# Which post-treatment inputs each specification is ALLOWED to consume. M1/M2/M3
+# include pass_length and pass_angle deliberately -- they exist to quantify how
+# much conventional model skill is outcome leakage, so their gap to M0 is the
+# estimate. The clean specs must consume none.
+#
+# This is a declaration, and declarations rot. validate.py enforces it against
+# build_design's source: it finds every d["col"] access under each spec branch
+# and fails if one touches a registered post-treatment column not allowed here.
+# A runtime assert cannot do this job -- build_design renames pass_length into
+# L_(0,4] bins and pass_angle into ang_sin/ang_cos, so checking X.columns would
+# pass vacuously on exactly the specifications that leak.
+SPEC_POST_TREATMENT = {
+    "M0": (), "M0i": (), "M0x": (),
+    "M1": ("pass_length", "pass_angle"),
+    "M2": ("pass_length", "pass_angle"),
+    "M3": ("pass_length", "pass_angle"),
+}
+CLEAN_SPECS = tuple(s for s, v in SPEC_POST_TREATMENT.items() if not v)
+
+
 def build_design(d: pd.DataFrame, spec: str) -> tuple[pd.DataFrame, np.ndarray]:
-    """spec in {M0, M1, M2}."""
+    """spec in {M0, M0i, M0x, M1, M2, M3}."""
     X = pd.DataFrame(index=d.index)
 
     # ---- carrier pressure -------------------------------------------------
